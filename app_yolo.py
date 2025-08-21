@@ -76,6 +76,7 @@ with st.sidebar:
     speed_thresh = st.slider("Avg speed threshold (px/sec)", 1, 300, 25)
     top_zone_pct = st.slider("Top zone height (%)", 2, 40, 12)
     bottom_zone_pct = st.slider("Bottom zone height (%)", 2, 40, 12)
+    use_fallback = st.checkbox("Fallback to classic detector if YOLO finds 0", value=True)
 
     st.header("Run")
     start = st.button("▶️ Start")

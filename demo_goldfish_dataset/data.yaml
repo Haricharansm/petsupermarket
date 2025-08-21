@@ -1,7 +1,8 @@
-path: .
-train: demo_goldfish_dataset/images/train
-val:  demo_goldfish_dataset/images/val
-# test: images/test   # optional
+# demo_goldfish_dataset/data.yaml
+path: demo_goldfish_dataset   # << anchor here, not "."
+train: images/train
+val: images/val
+# test: images/test           # optional
 names:
   0: goldfish
   1: other_fish

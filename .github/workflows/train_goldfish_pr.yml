@@ -153,6 +153,39 @@ jobs:
           cp "$BEST" weights/goldfish_best.pt
           ls -lh weights
 
+          # Predict on your real images after training
+      - name: Predict on demo images/test
+          if: always()
+          run: |
+          python - <<'PY'
+          import glob, os
+          from ultralytics import YOLO
+
+    # find best.pt
+    bests = sorted(glob.glob("runs/detect/*/weights/best.pt"), key=os.path.getmtime)
+    assert bests, "No best.pt produced"
+    best = bests[-1]
+    print("Using weights:", best)
+
+    model = YOLO(best)
+    # run prediction on your test images
+    model.predict(
+        source="demo_goldfish_dataset/images/test",
+        save=True,
+        imgsz=int("${{ github.event.inputs.imgsz || '640' }}"),
+        project="runs",
+        name="predict",
+        exist_ok=True
+    )
+    PY
+
+- name: Upload predictions
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: predictions
+    path: runs/predict/**
+
       - name: Create PR with weights
         uses: peter-evans/create-pull-request@v6
         with:

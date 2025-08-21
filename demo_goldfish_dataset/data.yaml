@@ -1,9 +1,7 @@
-# Demo synthetic dataset for goldfish detection
 path: .
 train: images/train
 val: images/val
-test: images/test
-
+# test: images/test   # optional
 names:
   0: goldfish
   1: other_fish

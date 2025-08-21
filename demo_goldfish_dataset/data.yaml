@@ -1,0 +1,10 @@
+# Demo synthetic dataset for goldfish detection
+path: .
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: goldfish
+  1: other_fish
+  2: debris

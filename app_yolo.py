@@ -6,6 +6,23 @@
 #   pip install -r requirements.txt
 #   streamlit run app_yolo.py
 import os
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+
+try:
+    import cv2
+except Exception as e:
+    import streamlit as st, platform, sys, numpy
+    st.error(
+        "OpenCV failed to import. Most common causes: wrong wheel, missing libGL, "
+        "or incompatible NumPy. Details below."
+    )
+    st.code(
+        f"Python={sys.version}\n"
+        f"Platform={platform.platform()}\n"
+        f"NumPy import OK: {hasattr(numpy, '__version__')} (numpy {getattr(numpy,'__version__','?')})\n"
+        f"Error: {repr(e)}"
+    )
+    st.stop()
 import time
 from typing import List, Dict, Tuple
 

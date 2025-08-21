@@ -33,6 +33,7 @@ import streamlit as st
 from yolo_infer import YOLOTracker
 from track_store import TrackStore, Track
 from decision import compute_avg_speed, is_likely_dead
+from classic_detector import ClassicDetector
 
 st.set_page_config(page_title="Dead Goldfish Detector (YOLO)", layout="wide")
 st.title("🐟 Dead Goldfish Detector — YOLO + ByteTrack")

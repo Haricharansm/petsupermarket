@@ -9,7 +9,7 @@ import numpy as np
 import streamlit as st
 
 st.set_page_config(page_title="Dead Goldfish Detector (Classic Demo)", layout="wide")
-st.title("🐟 Dead Goldfish Detector — Classic (no training)")
+st.title("🐟 Dead Goldfish Detector — Classic ")
 
 st.markdown("""
 This quick demo uses **color + motion** and a **simple tracker** to flag *likely dead* goldfish:

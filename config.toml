@@ -1,0 +1,8 @@
+[server]
+headless = true
+enableCORS = false
+maxUploadSize = 500
+
+[theme]
+base = "light"
+primaryColor = "#F55F44"

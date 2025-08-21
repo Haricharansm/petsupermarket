@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Streamlit uploads/temp
+tmp_upload.mp4
+alerts/*.jpg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ultralytics runs
+runs/

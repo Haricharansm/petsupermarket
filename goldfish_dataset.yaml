@@ -1,0 +1,11 @@
+# Template dataset YAML for Ultralytics YOLO training
+# Fill in your actual dataset root and relative paths.
+path: ../datasets/goldfish
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: goldfish
+  1: other_fish
+  2: debris

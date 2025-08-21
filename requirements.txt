@@ -1,4 +1,11 @@
-streamlit
-ultralytics
-opencv-python
-numpy
+# requirements.txt
+streamlit==1.36.0
+ultralytics==8.2.103
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# CPU PyTorch wheels (faster, avoids source builds)
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+torchaudio==2.3.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu

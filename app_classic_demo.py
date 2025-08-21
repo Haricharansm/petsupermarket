@@ -24,11 +24,23 @@ This quick demo uses **color + motion** and a **simple tracker** to flag *likely
 # ------------------------
 # Sidebar controls
 # ------------------------
+# --- Video Source (default = Upload MP4) ---
 with st.sidebar:
     st.header("Video Source")
-    source_mode = st.radio("Choose source", ["Upload MP4", "Webcam (0)"], index=0)
+
+    # set a first-run default
+    if "source_mode_classic" not in st.session_state:
+        st.session_state.source_mode_classic = "Upload MP4"
+
+    source_options = ["Upload MP4", "Webcam (0)"]
+    source_mode = st.radio(
+        "Choose source",
+        source_options,
+        index=source_options.index(st.session_state.source_mode_classic),
+        key="source_mode_classic",
+    )
+
     uploaded_file = st.file_uploader("Upload a short video", type=["mp4", "mov", "avi"])
-    st.caption("Tip: small 10–20s clips run fastest.")
 
     st.header("Color Gate (HSV)")
     st.write("Default targets orange goldfish; adjust if needed")

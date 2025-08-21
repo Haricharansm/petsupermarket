@@ -1,11 +1,11 @@
 streamlit==1.36.0
 ultralytics==8.2.103
 
-# Use HEADLESS OpenCV + a NumPy that matches the wheel
-opencv-python-headless==4.10.0.84
+# OpenCV (headless) + compatible NumPy
+opencv-python-headless==4.8.1.78
 numpy==1.26.4
 
-# CPU PyTorch (Ultralytics needs torch)
+# CPU-only PyTorch for Ultralytics
 torch==2.3.1+cpu
 torchvision==0.18.1+cpu
 torchaudio==2.3.1+cpu

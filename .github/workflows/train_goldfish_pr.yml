@@ -75,29 +75,39 @@ jobs:
           PY
 
       - name: Train with Ultralytics API (CPU)
-        env:
-          WANDB_DISABLED: "true"
-          EPOCHS: ${{ github.event.inputs.epochs || '30' }}
-          IMGSZ:  ${{ github.event.inputs.imgsz  || '640' }}
-        run: |
-          python - <<'PY'
-          import os
-          from ultralytics import YOLO
-          print("Starting training…")
-          model = YOLO("yolov8n.pt")  # auto-downloads backbone
-          model.train(
-              data="demo_goldfish_dataset/data.yaml",
-              epochs=int(os.environ.get("EPOCHS","30")),
-              imgsz=int(os.environ.get("IMGSZ","640")),
-              device="cpu",
-              batch=16,
-              project="runs",
-              name="train",
-              exist_ok=True,
-              verbose=True
-          )
-          PY
-          echo "Runs tree:" && ls -R runs || true
+  env:
+    WANDB_DISABLED: "true"
+  run: |
+    python - <<'PY'
+    import textwrap
+    from pathlib import Path
+    from ultralytics.utils import SETTINGS
+    from ultralytics import YOLO
+
+    # Force local dirs
+    SETTINGS.update({
+      "datasets_dir": str(Path.cwd()),
+      "runs_dir": str(Path.cwd() / "runs")
+    })
+
+    # Data file WITHOUT 'path:' (prevents datasets_dir prefix)
+    data = textwrap.dedent("""
+    train: demo_goldfish_dataset/images/train
+    val:   demo_goldfish_dataset/images/val
+    names:
+      0: goldfish
+      1: other_fish
+      2: debris
+    """).strip()+"\n"
+    Path("work_data.yaml").write_text(data)
+    print("--- work_data.yaml ---\n"+data)
+
+    # Train
+    model = YOLO("yolov8n.pt")
+    model.train(data="work_data.yaml", epochs=10, imgsz=640, device="cpu",
+                project="runs", name="train", exist_ok=True, verbose=True)
+    PY
+
 
       - name: Stage weights
         run: |

@@ -16,10 +16,11 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - name: Checkout main
+      - name: Checkout main (with LFS, just in case)
         uses: actions/checkout@v4
         with:
-          ref: main   # <-- change if your default branch isn't 'main'
+          ref: main          # <-- change if your default branch isn't 'main'
+          lfs: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,28 +28,65 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Ultralytics
+      - name: Install deps (CPU)
         run: |
           python -m pip install --upgrade pip
-          pip install ultralytics==8.2.103
+          # CPU-only PyTorch wheels
+          pip install "torch==2.3.1+cpu" "torchvision==0.18.1+cpu" "torchaudio==2.3.1+cpu" \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          # Ultralytics + runtime deps
+          pip install ultralytics==8.2.103 opencv-python-headless==4.8.1.78
+          # Trackers’ helpers (future-proof)
+          pip install lapx==0.5.9.post1 filterpy==1.4.5
+          python - <<'PY'
+          import torch, cv2, ultralytics
+          print("torch:", torch.__version__, "cuda?", torch.cuda.is_available())
+          print("cv2:", cv2.__version__)
+          print("ultralytics:", ultralytics.__version__)
+          PY
 
-      - name: Train on demo dataset (CPU)
+      - name: Verify dataset presence
         run: |
-          yolo detect train \
+          python - <<'PY'
+          import os, glob, sys, yaml, json
+          base = "demo_goldfish_dataset"
+          assert os.path.isdir(base), f"{base} folder missing"
+          for split in ("train","val"):
+            imgs = sum([len(glob.glob(f"{base}/images/{split}/*.{ext}")) for ext in ("jpg","jpeg","png")])
+            lbls = len(glob.glob(f"{base}/labels/{split}/*.txt"))
+            print(f"{split}: images={imgs} labels={lbls}")
+            if imgs == 0:
+              print(f"ERROR: No images found in {base}/images/{split}")
+              sys.exit(2)
+          # Show YAML for auditing
+          with open(f"{base}/data.yaml","r") as f:
+            y = f.read()
+          print("\n--- data.yaml ---\n", y)
+          PY
+
+      - name: Train (CPU)
+        env:
+          WANDB_DISABLED: "true"
+        run: |
+          python -m ultralytics detect train \
             data=demo_goldfish_dataset/data.yaml \
             model=yolov8n.pt \
             epochs=${{ github.event.inputs.epochs || '30' }} \
             imgsz=${{ github.event.inputs.imgsz || '640' }} \
-            batch=16 device=cpu \
-          || python -m ultralytics detect train \
-               data=demo_goldfish_dataset/data.yaml model=yolov8n.pt \
-               epochs=${{ github.event.inputs.epochs || '30' }} imgsz=${{ github.event.inputs.imgsz || '640' }} \
-               batch=16 device=cpu
+            batch=16 device=cpu
+          echo "Finished training, listing runs:"
+          ls -R runs || true
 
       - name: Stage weights
         run: |
           mkdir -p weights
-          cp runs/detect/*/weights/best.pt weights/goldfish_best.pt
+          BEST=$(ls -1t runs/detect/*/weights/best.pt | head -n1)
+          if [ -z "$BEST" ]; then
+            echo "No best.pt found under runs/detect/*/weights/"
+            exit 3
+          fi
+          cp "$BEST" weights/goldfish_best.pt
+          ls -lh weights
 
       - name: Create PR with weights
         uses: peter-evans/create-pull-request@v6
@@ -56,7 +94,7 @@ jobs:
           branch: weights/update
           commit-message: "Add/update goldfish weights"
           title: "Add/update goldfish weights"
-          body: "Automated training run from GitHub Actions."
+          body: "Automated training run (CPU) on demo_goldfish_dataset."
           add-paths: |
             weights/goldfish_best.pt
 

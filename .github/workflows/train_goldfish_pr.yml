@@ -13,7 +13,7 @@ permissions:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
 
     steps:
       - name: Checkout main
@@ -28,94 +28,50 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps (CPU, headless)
+      - name: Install pinned deps (CPU)
         run: |
           python -m pip install --upgrade pip
-          pip install "torch==2.3.1+cpu" "torchvision==0.18.1+cpu" "torchaudio==2.3.1+cpu" \
+          pip install --no-cache-dir \
+            torch==2.3.1+cpu torchvision==0.18.1+cpu torchaudio==2.3.1+cpu \
             --extra-index-url https://download.pytorch.org/whl/cpu
-          pip install ultralytics==8.2.103 opencv-python-headless==4.8.1.78 numpy lapx==0.5.9.post1 filterpy==1.4.5
+          pip install --no-cache-dir --upgrade \
+            ultralytics==8.2.103 opencv-python-headless==4.8.1.78 \
+            lapx==0.5.9.post1 filterpy==1.4.5
+
+      - name: Set Ultralytics settings and print env
+        run: |
           python - <<'PY'
-          import torch, cv2, ultralytics
+          from ultralytics.utils import SETTINGS
+          from pathlib import Path
+          import torch, cv2, ultralytics, json
+
+          SETTINGS.update({
+              "datasets_dir": str(Path.cwd()),
+              "runs_dir": str(Path.cwd() / "runs")
+          })
+          print("== VERSIONS ==")
           print("torch:", torch.__version__, "cuda?", torch.cuda.is_available())
           print("cv2:", cv2.__version__)
           print("ultralytics:", ultralytics.__version__)
+          print("== SETTINGS ==")
+          print(json.dumps(SETTINGS, indent=2))
           PY
 
-      - name: Verify/Bootstrap dataset + create working YAML
+      - name: Validate image/label pairs
         run: |
           python - <<'PY'
-          import os, glob, numpy as np, cv2, textwrap, random
-
-          base = "demo_goldfish_dataset"
-          for d in (f"{base}/images/train", f"{base}/images/val",
-                    f"{base}/labels/train", f"{base}/labels/val"):
-              os.makedirs(d, exist_ok=True)
-
-          def count(split):
-              imgs = sum(len(glob.glob(f"{base}/images/{split}/*.{e}")) for e in ("jpg","jpeg","png"))
-              lbls = len(glob.glob(f"{base}/labels/{split}/*.txt"))
-              return imgs, lbls
-
-          ti, tl = count("train"); vi, vl = count("val")
-          print(f"BEFORE  train: images={ti} labels={tl} | val: images={vi} labels={vl}")
-
-          # Bootstrap tiny synthetic set if empty (goldfish=0, other_fish=1)
-          if ti == 0 or vi == 0:
-              print("Bootstrapping tiny synthetic dataset…")
-              W,H = 640,360
-              def draw_goldfish(img, cx, cy, L=80, T=28, ang=0):
-                  color_body=(0,140,255); color_tail=(0,120,235)
-                  a=np.deg2rad(ang); axes=(max(10,int(L*0.5)), max(8,int(T*0.5)))
-                  cv2.ellipse(img,(int(cx),int(cy)),axes,ang,0,360,color_body,-1,cv2.LINE_AA)
-                  tail_len=int(L*0.35)
-                  tx=int(cx-np.cos(a)*axes[0]-np.cos(a)*tail_len)
-                  ty=int(cy-np.sin(a)*axes[0]-np.sin(a)*tail_len)
-                  p1=(int(cx-np.cos(a)*axes[0]), int(cy-np.sin(a)*axes[0]))
-                  p2=(int(tx+np.sin(a)*axes[1]), int(ty-np.cos(a)*axes[1]))
-                  p3=(int(tx-np.sin(a)*axes[1]), int(ty+np.cos(a)*axes[1]))
-                  cv2.fillPoly(img,[np.array([p1,p2,p3],np.int32)],color_tail,cv2.LINE_AA)
-
-              def draw_other(img, cx, cy, L=70, T=22, ang=0):
-                  color=(255,180,80)
-                  axes=(max(10,int(L*0.45)), max(8,int(T*0.45)))
-                  cv2.ellipse(img,(int(cx),int(cy)),axes,ang,0,360,color,-1,cv2.LINE_AA)
-
-              def make_sample(split, idx):
-                  img=np.zeros((H,W,3),np.uint8)
-                  grad=np.linspace(180,220,H).astype(np.uint8)
-                  img[:,:,1]=grad[:,None]; img[:,:,0]=(grad*0.6).astype(np.uint8)[:,None]
-                  ann=[]
-                  gx=np.random.randint(100,W-100); gy=np.random.randint(80,H-80); ang=np.random.randint(-20,20)
-                  draw_goldfish(img,gx,gy,ang=ang)
-                  w,h=120,70; x1=max(0,gx-w//2); y1=max(0,gy-h//2); x2=min(W,gx+w//2); y2=min(H,gy+h//2)
-                  cx=(x1+x2)/2/W; cy=(y1+y2)/2/H; bw=(x2-x1)/W; bh=(y2-y1)/H
-                  ann.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-                  for _ in range(np.random.randint(0,2)):
-                      ox=np.random.randint(80,W-80); oy=np.random.randint(60,H-60); oang=np.random.randint(-30,30)
-                      draw_other(img,ox,oy,ang=oang)
-                      w2,h2=110,60; x1=max(0,ox-w2//2); y1=max(0,oy-h2//2); x2=min(W,ox+w2//2); y2=min(H,oy+h2//2)
-                      cx2=(x1+x2)/2/W; cy2=(y1+y2)/2/H; bw2=(x2-x1)/W; bh2=(y2-y1)/H
-                      ann.append(f"1 {cx2:.6f} {cy2:.6f} {bw2:.6f} {bh2:.6f}")
-                  img_p=f"{base}/images/{split}/{idx:05d}.jpg"
-                  lbl_p=f"{base}/labels/{split}/{idx:05d}.txt"
-                  cv2.imwrite(img_p,img); open(lbl_p,"w").write("\n".join(ann))
-
-              for k in range(60): make_sample("train", k)
-              for k in range(20): make_sample("val", k)
-
-          ti, tl = count("train"); vi, vl = count("val")
-          print(f"AFTER   train: images={ti} labels={tl} | val: images={vi} labels={vl}")
-
-          yaml_text = textwrap.dedent(f"""
-          path: .
-          train: {base}/images/train
-          val:   {base}/images/val
-          names:
-            0: goldfish
-            1: other_fish
-          """).strip()+"\n"
-          open("work_data.yaml","w").write(yaml_text)
-          print("\\n--- work_data.yaml ---\\n"+yaml_text)
+          from pathlib import Path
+          base = Path("demo_goldfish_dataset")
+          for split in ("train","val"):
+              imgs = {p.stem for p in (base/"images"/split).glob("*.*")}
+              lbls = {p.stem for p in (base/"labels"/split).glob("*.txt")}
+              print(f"[{split}] images={len(imgs)} labels={len(lbls)}")
+              miss_lbl = sorted(imgs - lbls)
+              miss_img = sorted(lbls - imgs)
+              if miss_lbl: print("  missing labels (first 10):", miss_lbl[:10])
+              if miss_img: print("  missing images (first 10):", miss_img[:10])
+              if not imgs: raise SystemExit(f"No images in images/{split}")
+              if miss_lbl: raise SystemExit(f"Some labels missing for {split}")
           PY
 
       - name: Train with Ultralytics API (CPU)
@@ -128,9 +84,9 @@ jobs:
           import os
           from ultralytics import YOLO
           print("Starting training…")
-          model = YOLO("yolov8n.pt")
+          model = YOLO("yolov8n.pt")  # auto-downloads backbone
           model.train(
-              data="work_data.yaml",
+              data="demo_goldfish_dataset/data.yaml",
               epochs=int(os.environ.get("EPOCHS","30")),
               imgsz=int(os.environ.get("IMGSZ","640")),
               device="cpu",
@@ -153,57 +109,12 @@ jobs:
           cp "$BEST" weights/goldfish_best.pt
           ls -lh weights
 
-          # Predict on your real images after training
-      - name: Predict on demo images/test
-          if: always()
-          run: |
-          python - <<'PY'
-          import glob, os
-          from ultralytics import YOLO
-
-    # find best.pt
-    bests = sorted(glob.glob("runs/detect/*/weights/best.pt"), key=os.path.getmtime)
-    assert bests, "No best.pt produced"
-    best = bests[-1]
-    print("Using weights:", best)
-
-    model = YOLO(best)
-    # run prediction on your test images
-    model.predict(
-        source="demo_goldfish_dataset/images/test",
-        save=True,
-        imgsz=int("${{ github.event.inputs.imgsz || '640' }}"),
-        project="runs",
-        name="predict",
-        exist_ok=True
-    )
-    PY
-
-- name: Upload predictions
-  if: always()
-  uses: actions/upload-artifact@v4
-  with:
-    name: predictions
-    path: runs/predict/**
-
       - name: Create PR with weights
         uses: peter-evans/create-pull-request@v6
         with:
           branch: weights/update
           commit-message: "Add/update goldfish weights"
           title: "Add/update goldfish weights"
-          body: "Automated training run (CPU) using work_data.yaml."
+          body: "Automated training run (CPU) using demo_goldfish_dataset/data.yaml."
           add-paths: |
             weights/goldfish_best.pt
-            work_data.yaml
-
-      - name: Upload diagnostics (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runs-and-weights
-          path: |
-            runs/**
-            weights/**
-            work_data.yaml
-            demo_goldfish_dataset/data.yaml

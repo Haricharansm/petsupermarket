@@ -1,6 +1,6 @@
 path: .
-train: images/train
-val: images/val
+train: demo_goldfish_dataset/images/train
+val:  demo_goldfish_dataset/images/val
 # test: images/test   # optional
 names:
   0: goldfish

@@ -1,34 +1,219 @@
-# app_classic_demo.py
-# Streamlit demo WITHOUT training: color + motion + simple tracking
-import os, time, math, uuid
+# classic_yolo.py
+# Streamlit app: Classic (color + motion) "Dead Goldfish Detector" + natural-language insights
+# Run:
+#   pip install streamlit opencv-python-headless numpy
+#   streamlit run classic_yolo.py
+
+import os
+import time
 from collections import deque
-from typing import Dict, Deque, Tuple, List
+from statistics import median
 
 import cv2
 import numpy as np
 import streamlit as st
 
-st.set_page_config(page_title="Dead Goldfish Detector (Classic Demo)", layout="wide")
-st.title("🐟 Dead Goldfish Detector — Classic ")
+
+# ============================
+# Small, self-contained tracker
+# ============================
+
+class Track:
+    """Simple centroid track with time-stamped history: (t, cx, cy)."""
+    def __init__(self, tid, cx, cy, t_now, maxlen=600):
+        self.id = tid
+        self.history = deque(maxlen=maxlen)  # (t, cx, cy)
+        self.last_t = t_now
+        self.add_point(t_now, cx, cy)
+
+    def add_point(self, t, cx, cy):
+        self.history.append((t, float(cx), float(cy)))
+        self.last_t = t
+
+class Tracker:
+    """Nearest-neighbor association on centroids with a gating distance."""
+    def __init__(self, max_dist=60.0, stale_sec=2.5, maxlen=600):
+        self.max_dist = float(max_dist)
+        self.stale_sec = float(stale_sec)
+        self.maxlen = int(maxlen)
+        self.tracks = {}      # tid -> Track
+        self._next_id = 1
+
+    def _distance(self, a, b):
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+    def _spawn(self, cx, cy, t_now):
+        tid = self._next_id
+        self._next_id += 1
+        self.tracks[tid] = Track(tid, cx, cy, t_now, self.maxlen)
+        return tid
+
+    def _prune_stale(self, t_now):
+        stale = [tid for tid, tr in self.tracks.items() if t_now - tr.last_t > self.stale_sec]
+        for tid in stale:
+            self.tracks.pop(tid, None)
+
+    def update(self, detections, t_now):
+        """
+        detections: list of dicts with keys: 'cx','cy','bbox'
+        Returns the same detections augmented with 'tid'.
+        """
+        self._prune_stale(t_now)
+
+        # Build candidate pairs (det, track) within gate
+        det_indices = list(range(len(detections)))
+        track_items = list(self.tracks.items())  # [(tid, tr), ...]
+        pairs = []
+        for di in det_indices:
+            cx, cy = detections[di]['cx'], detections[di]['cy']
+            for tid, tr in track_items:
+                # use most recent track point as target
+                _, tx, ty = tr.history[-1]
+                d = self._distance((cx, cy), (tx, ty))
+                if d <= self.max_dist:
+                    pairs.append((d, di, tid))
+        # Greedy assignment by distance
+        pairs.sort(key=lambda x: x[0])
+        used_det = set()
+        used_tid = set()
+        for d, di, tid in pairs:
+            if di in used_det or tid in used_tid:
+                continue
+            used_det.add(di)
+            used_tid.add(tid)
+            # assign
+            cx, cy = detections[di]['cx'], detections[di]['cy']
+            self.tracks[tid].add_point(t_now, cx, cy)
+            detections[di]['tid'] = tid
+
+        # Spawn new tracks for unmatched dets
+        for di in det_indices:
+            if di not in used_det:
+                cx, cy = detections[di]['cx'], detections[di]['cy']
+                tid = self._spawn(cx, cy, t_now)
+                detections[di]['tid'] = tid
+
+        return detections
+
+
+# ============================
+# Classic color+motion detector
+# ============================
+
+def color_mask(frame_bgr, h_low, h_high, s_low, s_high, v_low, v_high):
+    """HSV mask for orange-y fish."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
+    upper = np.array([h_high, s_high, v_high], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    return mask
+
+def detect_from_mask(mask, min_area=150):
+    """Return list of detections [{'cx','cy','bbox'}] from a binary mask."""
+    # clean-up
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=2)
+    # contours
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    dets = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        x,y,w,h = cv2.boundingRect(c)
+        M = cv2.moments(c)
+        if M["m00"] <= 1e-6:
+            continue
+        cx = int(M["m10"]/M["m00"])
+        cy = int(M["m01"]/M["m00"])
+        dets.append(dict(cx=cx, cy=cy, bbox=(x,y,x+w,y+h)))
+    return dets
+
+
+# ============================
+# Insights (natural language)
+# ============================
+
+def avg_speed_px_s(tr: Track, now_t: float, win_sec: float) -> float:
+    pts = [p for p in tr.history if now_t - p[0] <= win_sec]
+    if len(pts) < 2: return 0.0
+    dist = 0.0
+    for i in range(1, len(pts)):
+        dx = pts[i][1] - pts[i-1][1]
+        dy = pts[i][2] - pts[i-1][2]
+        dist += float(np.hypot(dx, dy))
+    dt = pts[-1][0] - pts[0][0]
+    return dist / dt if dt > 1e-6 else 0.0
+
+def status_for_track(avg_v: float, at_top: bool, at_bottom: bool,
+                     speed_thresh: float, window_sec: float):
+    low_motion = avg_v <= speed_thresh
+    if low_motion and (at_top or at_bottom):
+        where = "top" if at_top else "bottom"
+        return ("likely_dead", f"still ~{int(window_sec)}s near **{where}**")
+    if low_motion:
+        return ("resting", f"still ~{int(window_sec)}s (mid-water)")
+    return ("alive", f"active (v≈{avg_v:.0f}px/s)")
+
+def render_insights(tracker: Tracker, now_t: float, h: int, top_h: int, bot_h: int,
+                    window_sec: float, speed_thresh: float) -> str:
+    speeds, dead_lines, rest_lines = [], [], []
+    for tid, tr in list(tracker.tracks.items()):
+        avg_v = avg_speed_px_s(tr, now_t, window_sec)
+        speeds.append(avg_v)
+        if not tr.history: continue
+        _, cx, cy = tr.history[-1]
+        at_top = cy <= top_h
+        at_bottom = cy >= (h - bot_h)
+        status, why = status_for_track(avg_v, at_top, at_bottom, speed_thresh, window_sec)
+        if status == "likely_dead":
+            dead_lines.append(f"• **Fish #{tid}** → ⚠️ *likely dead*: {why} (v≈{avg_v:.0f}px/s)")
+        elif status == "resting":
+            rest_lines.append(f"• Fish #{tid} → 💤 *resting*: {why} (v≈{avg_v:.0f}px/s)")
+
+    n_tracks = len(tracker.tracks)
+    n_dead, n_rest = len(dead_lines), len(rest_lines)
+    med_v = median(speeds) if speeds else 0.0
+    max_v = max(speeds) if speeds else 0.0
+
+    if n_dead > 0:
+        headline = f"**Now:** {n_tracks} fish | **{n_dead} likely dead**, {n_rest} resting | median v≈{med_v:.0f}px/s, max v≈{max_v:.0f}px/s"
+    elif n_rest > 0:
+        headline = f"**Now:** {n_tracks} fish | none likely dead, **{n_rest} resting** | median v≈{med_v:.0f}px/s, max v≈{max_v:.0f}px/s"
+    else:
+        headline = f"**Now:** {n_tracks} fish | ✅ all look active | median v≈{med_v:.0f}px/s, max v≈{max_v:.0f}px/s"
+
+    md = [headline, ""]
+    if dead_lines:
+        md += ["### ⚠️ Likely dead", *dead_lines, ""]
+    if rest_lines:
+        md += ["### 💤 Possibly resting (low motion, not top/bottom)", *rest_lines, ""]
+    return "\n".join(md)
+
+
+# ============================
+# Streamlit UI
+# ============================
+
+st.set_page_config(page_title="Dead Goldfish Detector — Classic", layout="wide")
+st.title("🐟 Dead Goldfish Detector — Classic")
 
 st.markdown("""
-This quick demo uses **color + motion** and a **simple tracker** to flag *likely dead* goldfish:
+This mode uses **color + motion** and a **simple tracker** to flag *likely dead* goldfish:
 
 - Detect **orange** fish via HSV color mask  
 - Track centroids across frames  
 - If **avg speed** is low for *N* seconds **and** the fish dwells near the **top** or **bottom**, raise an alert  
 
-> Perfect for a live demo while your YOLO model is still training.
+Use this mode standalone or alongside a trained YOLO model.
 """)
 
-# ------------------------
-# Sidebar controls
-# ------------------------
-# --- Video Source (default = Upload MP4) ---
+# --- Sidebar controls ---
 with st.sidebar:
     st.header("Video Source")
 
-    # set a first-run default
+    # Default to Upload MP4; remember last choice
     if "source_mode_classic" not in st.session_state:
         st.session_state.source_mode_classic = "Upload MP4"
 
@@ -41,41 +226,50 @@ with st.sidebar:
     )
 
     uploaded_file = st.file_uploader("Upload a short video", type=["mp4", "mov", "avi"])
+    st.caption("Tip: small 10–20s clips run fastest.")
 
     st.header("Color Gate (HSV)")
-    st.write("Default targets orange goldfish; adjust if needed")
-    h_low  = st.slider("H low", 0, 179, 5)
-    h_high = st.slider("H high", 0, 179, 30)
-    s_low  = st.slider("S low", 0, 255, 120)
+    # Defaults target “orange”: roughly 5–25 hue range
+    h_low  = st.slider("H low",  0, 179, 5)
+    h_high = st.slider("H high", 0, 179, 25)
+    s_low  = st.slider("S low",  0, 255, 120)
     s_high = st.slider("S high", 0, 255, 255)
-    v_low  = st.slider("V low", 0, 255, 90)
+    v_low  = st.slider("V low",  0, 255, 80)
     v_high = st.slider("V high", 0, 255, 255)
-    min_area = st.slider("Min blob area (px)", 50, 5000, 600, 50)
-    blur_k   = st.slider("Blur (odd kernel)", 1, 15, 5, 2)
+
+    show_mask = st.checkbox("Show mask", value=False)
 
     st.header("Decision Rules")
-    window_sec   = st.slider("Stillness window (seconds)", 3, 60, 12)
-    speed_thresh = st.slider("Avg speed threshold (px/sec)", 1, 200, 25)
-    top_pct      = st.slider("Top zone height (%)", 2, 40, 12)
-    bottom_pct   = st.slider("Bottom zone height (%)", 2, 40, 12)
+    window_sec   = st.slider("Stillness window (seconds)", 5, 120, 30)
+    speed_thresh = st.slider("Avg speed threshold (px/sec)", 1, 300, 25)
+    top_zone_pct = st.slider("Top zone height (%)", 2, 40, 12)
+    bot_zone_pct = st.slider("Bottom zone height (%)", 2, 40, 12)
+
+    st.header("Tracker")
+    max_match_dist = st.slider("Max match distance (px)", 10, 150, 70)
+    min_area = st.slider("Min blob area (px)", 50, 4000, 150)
+    stale_sec = st.slider("Track stale timeout (s)", 1, 10, 3)
 
     st.header("Run")
-    run_btn  = st.button("▶️ Process")
-    stop_btn = st.button("⏹ Stop")
-    if "running" not in st.session_state: st.session_state.running = False
-    if run_btn:  st.session_state.running = True
-    if stop_btn: st.session_state.running = False
+    start = st.button("▶️ Start")
+    stop = st.button("⏹ Stop")
+    if "running" not in st.session_state:
+        st.session_state.running = False
+    if start: st.session_state.running = True
+    if stop: st.session_state.running = False
 
-# ------------------------
-# Helpers
-# ------------------------
+# --- Placeholders ---
+frame_info_ph = st.empty()
+preview_ph    = st.empty()
+insights_ph   = st.container()
+
 def open_capture():
     if source_mode == "Webcam (0)":
         cap = cv2.VideoCapture(0)
     else:
         if uploaded_file is None:
             return None
-        tmp_path = "classic_tmp.mp4"
+        tmp_path = "tmp_upload_video.mp4"
         with open(tmp_path, "wb") as f:
             f.write(uploaded_file.read())
         cap = cv2.VideoCapture(tmp_path)
@@ -83,104 +277,13 @@ def open_capture():
         return None
     return cap
 
-def orange_mask(bgr, hsv_lo, hsv_hi, blur_k=5):
-    img = bgr
-    if blur_k >= 3 and blur_k % 2 == 1:
-        img = cv2.GaussianBlur(bgr, (blur_k, blur_k), 0)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, hsv_lo, hsv_hi)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, np.ones((5,5), np.uint8), iterations=1)
-    return mask
-
-def detect_candidates(frame, hsv_lo, hsv_hi, min_area, blur_k):
-    mask = orange_mask(frame, hsv_lo, hsv_hi, blur_k)
-    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes, centers = [], []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < min_area: 
-            continue
-        x,y,w,h = cv2.boundingRect(c)
-        boxes.append((x,y,x+w,y+h))
-        centers.append((x + w/2.0, y + h/2.0))
-    return boxes, centers, mask
-
-# very simple nearest-neighbor tracker
-class Track:
-    def __init__(self, cx, cy, t):
-        self.id = str(uuid.uuid4())[:8]
-        self.history: Deque[Tuple[float,float,float]] = deque(maxlen=6000)  # (t,x,y)
-        self.last_t = t
-        self.last_xy = (cx, cy)
-        self.last_alert_t = 0.0
-        self.history.append((t, cx, cy))
-
-    def update(self, cx, cy, t):
-        self.last_t = t
-        self.last_xy = (cx, cy)
-        self.history.append((t, cx, cy))
-
-Tracks: Dict[str, Track] = {}
-def step_tracker(detections: List[Tuple[float,float]], t: float, max_dist=60.0, stale_sec=4.0):
-    global Tracks
-    # match by nearest distance
-    dets = detections[:]
-    used = set()
-    # try to match existing tracks
-    for tid, tr in list(Tracks.items()):
-        if not dets: break
-        dists = [math.hypot(tr.last_xy[0]-cx, tr.last_xy[1]-cy) for (cx,cy) in dets]
-        j = int(np.argmin(dists)) if dists else -1
-        if j >= 0 and dists[j] <= max_dist:
-            cx,cy = dets[j]
-            tr.update(cx,cy,t)
-            used.add(j)
-        # drop stale tracks
-        if t - tr.last_t > stale_sec:
-            del Tracks[tid]
-
-    # new tracks for unmatched detections
-    for j,(cx,cy) in enumerate(dets):
-        if j in used: 
-            continue
-        tr = Track(cx,cy,t)
-        Tracks[tr.id] = tr
-
-def avg_speed_px_sec(tr: Track, now_t: float, win_sec: float) -> float:
-    pts = list(tr.history)
-    if len(pts) < 2:
-        return 0.0
-    # use last win_sec seconds
-    tail = [p for p in pts if now_t - p[0] <= win_sec]
-    if len(tail) < 2:
-        tail = pts[-min(10, len(pts)):]  # small fallback
-    dist = 0.0
-    dt    = tail[-1][0] - tail[0][0]
-    for i in range(1, len(tail)):
-        _,x1,y1 = tail[i-1]
-        _,x2,y2 = tail[i]
-        dist += math.hypot(x2-x1, y2-y1)
-    if dt <= 1e-6:
-        return 0.0
-    return dist / dt
-
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-
-# ------------------------
-# Main
-# ------------------------
-alerts_dir = "alerts"
-ensure_dir(alerts_dir)
-frame_info = st.empty()
-preview   = st.empty()
-mask_view = st.checkbox("Show mask", value=False)
-
+# Main loop
 cap = open_capture()
 if not cap:
     st.warning("Provide a valid source (upload a video or use Webcam 0).")
     st.stop()
 
+tracker = Tracker(max_dist=max_match_dist, stale_sec=stale_sec)
 fps_smooth = 0.0
 last_t = time.time()
 
@@ -190,78 +293,77 @@ while st.session_state.running:
         st.info("End of stream or cannot read more frames.")
         break
 
-    now_t = time.time()
-    dt = now_t - last_t
-    last_t = now_t
-    fps = 1.0/dt if dt>1e-3 else 0.0
-    fps_smooth = fps if fps_smooth == 0 else 0.9*fps_smooth + 0.1*fps
+    t_now = time.time()
+    dt = t_now - last_t
+    last_t = t_now
+    fps = 1.0 / dt if dt > 1e-3 else 0.0
+    fps_smooth = 0.85 * fps_smooth + 0.15 * fps if fps_smooth > 0 else fps
 
-    h,w = frame.shape[:2]
-    top_h = int(h * (top_pct/100.0))
-    bot_h = int(h * (bottom_pct/100.0))
+    h, w = frame.shape[:2]
+    top_h = int(h * (top_zone_pct/100.0))
+    bot_h = int(h * (bot_zone_pct/100.0))
 
-    hsv_lo = np.array([h_low, s_low, v_low], dtype=np.uint8)
-    hsv_hi = np.array([h_high, s_high, v_high], dtype=np.uint8)
+    # Mask & detections
+    mask = color_mask(frame, h_low, h_high, s_low, s_high, v_low, v_high)
+    dets = detect_from_mask(mask, min_area=min_area)
 
-    boxes, centers, mask = detect_candidates(frame, hsv_lo, hsv_hi, min_area, blur_k)
-    step_tracker(centers, now_t)
+    # Track
+    dets = tracker.update(dets, t_now)
 
+    # Draw overlay
     overlay = frame.copy()
     # zones
-    cv2.rectangle(overlay, (0,0), (w, top_h), (255,0,0), 2)
-    cv2.rectangle(overlay, (0,h-bot_h), (w, h), (0,0,255), 2)
+    cv2.rectangle(overlay, (0,0), (w, top_h), (255, 0, 0), 2)
+    cv2.rectangle(overlay, (0,h-bot_h), (w, h), (0, 0, 255), 2)
 
-    # draw detections
-    for (x1,y1,x2,y2) in boxes:
-        cv2.rectangle(overlay, (x1,y1), (x2,y2), (0,255,0), 2)
-
-    # decisions per track
-    alerts = 0
-    for tid,tr in list(Tracks.items()):
-        cx,cy = tr.last_xy
-        avg_v  = avg_speed_px_sec(tr, now_t, window_sec)
+    # visualize dets & tracks
+    for d in dets:
+        x1,y1,x2,y2 = d['bbox']
+        cx, cy = int(d['cx']), int(d['cy'])
+        tid = d['tid']
+        tr = tracker.tracks.get(tid)
+        # speed over window for live label
+        avg_v = avg_speed_px_s(tr, t_now, window_sec) if tr else 0.0
         at_top = cy <= top_h
-        at_bot = cy >= (h - bot_h)
-        likely = (avg_v < speed_thresh) and (at_top or at_bot)
+        at_bottom = cy >= (h - bot_h)
+        status, _ = status_for_track(avg_v, at_top, at_bottom, speed_thresh, window_sec)
 
-        color = (0,255,0)
-        label = f"id={tid} v={avg_v:.0f}px/s"
-        if likely and (now_t - tr.last_alert_t) > 5.0:
-            tr.last_alert_t = now_t
-            color = (0,0,255)
-            label += "  ⚠ likely dead"
-            # snapshot
-            sx1,sy1 = int(max(0,cx-60)), int(max(0,cy-40))
-            sx2,sy2 = int(min(w,cx+60)), int(min(h,cy+40))
-            crop = frame[sy1:sy2, sx1:sx2]
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            cv2.imwrite(os.path.join(alerts_dir, f"alert_{ts}_id{tid}.jpg"), crop)
-            alerts += 1
+        color = (0,255,0)  # alive
+        if status == "resting":      color = (0,200,255)
+        elif status == "likely_dead": color = (0,0,255)
 
-        cv2.circle(overlay, (int(cx), int(cy)), 6, color, -1, cv2.LINE_AA)
-        cv2.putText(overlay, label, (int(cx)+8, int(cy)-8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.rectangle(overlay, (x1,y1), (x2,y2), color, 2)
+        label = f"#{tid} v={avg_v:.0f}px/s"
+        cv2.putText(overlay, label, (x1, max(10,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-        # draw small trail
-        pts = list(tr.history)[-20:]
-        for i in range(1, len(pts)):
-            _,x1,y1 = pts[i-1]
-            _,x2,y2 = pts[i]
-            cv2.line(overlay, (int(x1),int(y1)), (int(x2),int(y2)), (200,200,0), 1)
+        # short trajectory
+        if tr and len(tr.history) > 1:
+            pts = list(tr.history)[-20:]
+            for i in range(1, len(pts)):
+                p1 = (int(pts[i-1][1]), int(pts[i-1][2]))
+                p2 = (int(pts[i][1]),   int(pts[i][2]))
+                cv2.line(overlay, p1, p2, (200,200,0), 1)
 
-    if mask_view:
-        m3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        overlay = np.hstack([overlay, m3])
+        cv2.circle(overlay, (cx,cy), 2, (0,255,255), -1)
 
-    frame_info.write(f"Frame: {w}×{h} | FPS: {fps_smooth:.1f} | Tracks: {len(Tracks)}")
-    preview.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
+    # Show frame or mask
+    vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if show_mask else overlay
+    frame_info_ph.write(f"Frame: {w}×{h} | FPS: {fps_smooth:.1f} | Tracks: {len(tracker.tracks)}")
+    preview_ph.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
 
-    # small sleep to keep Streamlit responsive
+    # Insights
+    insights_md = render_insights(tracker, t_now, h, top_h, bot_h, window_sec, speed_thresh)
+    with insights_ph:
+        st.subheader("Insights")
+        st.markdown(insights_md)
+
+    # keep UI responsive
     time.sleep(0.005)
 
+# cleanup
 try:
     cap.release()
 except Exception:
     pass
 
-st.success("Done. Open the 'alerts' folder to see any snapshots.")
+st.success("Stopped. Adjust parameters and hit Start again.")

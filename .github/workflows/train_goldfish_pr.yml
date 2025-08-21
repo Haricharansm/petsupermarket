@@ -41,42 +41,47 @@ jobs:
           print("ultralytics:", ultralytics.__version__)
           PY
 
+      - name: Show data.yaml
+        run: |
+          echo "----- demo_goldfish_dataset/data.yaml -----"
+          cat demo_goldfish_dataset/data.yaml || true
+          echo "------------------------------------------"
+
       - name: Verify / bootstrap dataset
         run: |
           python - <<'PY'
-          import os, glob, random, math
-          import numpy as np
-          import cv2
+          import os, glob, random, math, numpy as np, cv2
 
           base = "demo_goldfish_dataset"
-          img_dir = lambda s: f"{base}/images/{s}"
-          lbl_dir = lambda s: f"{base}/labels/{s}"
+          i = lambda s: f"{base}/images/{s}"
+          l = lambda s: f"{base}/labels/{s}"
 
-          def counts(split):
-            imgs = sum(len(glob.glob(f"{img_dir(split)}/*.{ext}")) for ext in ("jpg","jpeg","png"))
-            lbls = len(glob.glob(f"{lbl_dir(split)}/*.txt"))
-            return imgs, lbls
-
-          for d in [img_dir("train"), img_dir("val"), lbl_dir("train"), lbl_dir("val")]:
+          for d in (i("train"), i("val"), l("train"), l("val")):
             os.makedirs(d, exist_ok=True)
 
-          t_imgs, t_lbls = counts("train")
-          v_imgs, v_lbls = counts("val")
-          print(f"BEFORE  train: images={t_imgs} labels={t_lbls} | val: images={v_imgs} labels={v_lbls}")
+          def counts(split):
+            imgs = sum(len(glob.glob(f"{i(split)}/*.{ext}")) for ext in ("jpg","jpeg","png"))
+            lbls = len(glob.glob(f"{l(split)}/*.txt"))
+            return imgs, lbls
 
-          # If empty, bootstrap a tiny synthetic set so training can proceed
-          if t_imgs == 0 or v_imgs == 0:
-            print("Bootstrapping tiny synthetic dataset (cartoon fish)...")
+          t_img,t_lbl = counts("train"); v_img,v_lbl = counts("val")
+          print(f"BEFORE  train: images={t_img} labels={t_lbl} | val: images={v_img} labels={v_lbl}")
+
+          if t_img == 0 or v_img == 0:
+            print("Bootstrapping tiny synthetic dataset…")
             W,H = 640,360
 
             def draw_goldfish(img, cx, cy, L=80, T=28, ang=0):
               color_body=(0,140,255); color_tail=(0,120,235)
-              a=np.deg2rad(ang); axes=(max(10,int(L*0.5)), max(8,int(T*0.5)))
+              a=np.deg2rad(ang)
+              axes=(max(10,int(L*0.5)), max(8,int(T*0.5)))
               cv2.ellipse(img,(int(cx),int(cy)),axes,ang,0,360,color_body,-1,cv2.LINE_AA)
-              tail_len=int(L*0.35); tx=int(cx-math.cos(a)*axes[0]-math.cos(a)*tail_len); ty=int(cy-math.sin(a)*axes[0]-math.sin(a)*tail_len)
-              p1=(int(cx-math.cos(a)*axes[0]), int(cy-math.sin(a)*axes[0]))
-              p2=(int(tx+math.sin(a)*axes[1]), int(ty-math.cos(a)*axes[1]))
-              p3=(int(tx-math.sin(a)*axes[1]), int(ty+math.cos(a)*axes[1]))
+              tail_len=int(L*0.35)
+              tx=int(cx-np.cos(a)*axes[0]-np.cos(a)*tail_len)
+              ty=int(cy-np.sin(a)*axes[0]-np.sin(a)*tail_len)
+              p1=(int(cx-np.cos(a)*axes[0]), int(cy-np.sin(a)*axes[0]))
+              p2=(int(tx+np.sin(a)*axes[1]), int(ty-np.cos(a)*axes[1]))
+              p3=(int(tx-np.sin(a)*axes[1]), int(ty+np.cos(a)*axes[1]))
               cv2.fillPoly(img,[np.array([p1,p2,p3],np.int32)],color_tail,cv2.LINE_AA)
 
             def draw_other(img, cx, cy, L=70, T=22, ang=0):
@@ -86,53 +91,62 @@ jobs:
 
             def make_sample(split, idx):
               img=np.zeros((H,W,3),np.uint8)
-              grad=np.linspace(180,220,H).astype(np.uint8); img[:,:,1]=grad[:,None]; img[:,:,0]=(grad*0.6).astype(np.uint8)[:,None]
+              grad=np.linspace(180,220,H).astype(np.uint8)
+              img[:,:,1]=grad[:,None]; img[:,:,0]=(grad*0.6).astype(np.uint8)[:,None]
               ann=[]
-              # one goldfish + 0-2 other fish
-              gx=random.randint(100,W-100); gy=random.randint(80,H-80); ang=random.randint(-20,20)
+              gx=np.random.randint(100,W-100); gy=np.random.randint(80,H-80); ang=np.random.randint(-20,20)
               draw_goldfish(img,gx,gy,ang=ang)
-              # YOLO bbox for goldfish (class 0)
               w,h=120,70; x1=max(0,gx-w//2); y1=max(0,gy-h//2); x2=min(W,gx+w//2); y2=min(H,gy+h//2)
               cx=(x1+x2)/2/W; cy=(y1+y2)/2/H; bw=(x2-x1)/W; bh=(y2-y1)/H
               ann.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-              for _ in range(random.randint(0,2)):
-                ox=random.randint(80,W-80); oy=random.randint(60,H-60); oang=random.randint(-30,30)
+              for _ in range(np.random.randint(0,2)):
+                ox=np.random.randint(80,W-80); oy=np.random.randint(60,H-60); oang=np.random.randint(-30,30)
                 draw_other(img,ox,oy,ang=oang)
                 w2,h2=110,60; x1=max(0,ox-w2//2); y1=max(0,oy-h2//2); x2=min(W,ox+w2//2); y2=min(H,oy+h2//2)
                 cx2=(x1+x2)/2/W; cy2=(y1+y2)/2/H; bw2=(x2-x1)/W; bh2=(y2-y1)/H
                 ann.append(f"1 {cx2:.6f} {cy2:.6f} {bw2:.6f} {bh2:.6f}")
-
-              img_p=f"{img_dir(split)}/{idx:05d}.jpg"; lbl_p=f"{lbl_dir(split)}/{idx:05d}.txt"
+              img_p=f"{i(split)}/{idx:05d}.jpg"; lbl_p=f"{l(split)}/{idx:05d}.txt"
               cv2.imwrite(img_p,img); open(lbl_p,"w").write("\n".join(ann))
 
-            # create 60 train / 20 val
-            for i in range(60): make_sample("train", i)
-            for i in range(20): make_sample("val", i)
+            for k in range(60): make_sample("train", k)
+            for k in range(20): make_sample("val", k)
 
-          t_imgs, t_lbls = counts("train")
-          v_imgs, v_lbls = counts("val")
-          print(f"AFTER   train: images={t_imgs} labels={t_lbls} | val: images={v_imgs} labels={v_lbls}")
+          t_img,t_lbl = counts("train"); v_img,v_lbl = counts("val")
+          print(f"AFTER   train: images={t_img} labels={t_lbl} | val: images={v_img} labels={v_lbl}")
           PY
 
-      - name: Train (CPU)
-        env: { WANDB_DISABLED: "true" }
+      - name: Train with Ultralytics API (CPU)
+        env:
+          WANDB_DISABLED: "true"
+          EPOCHS: ${{ github.event.inputs.epochs || '30' }}
+          IMGSZ:  ${{ github.event.inputs.imgsz  || '640' }}
         run: |
-          python -m ultralytics detect train \
-            data=demo_goldfish_dataset/data.yaml \
-            model=yolov8n.pt \
-            epochs=${{ github.event.inputs.epochs || '30' }} \
-            imgsz=${{ github.event.inputs.imgsz || '640' }} \
-            batch=16 device=cpu
-          echo "Finished training:"
-          ls -R runs || true
+          python - <<'PY'
+          import os
+          from ultralytics import YOLO
+          print("Starting training…")
+          model = YOLO("yolov8n.pt")
+          results = model.train(
+              data="demo_goldfish_dataset/data.yaml",
+              epochs=int(os.environ.get("EPOCHS","30")),
+              imgsz=int(os.environ.get("IMGSZ","640")),
+              device="cpu",
+              batch=16,
+              project="runs",
+              name="train",
+              exist_ok=True,
+              verbose=True
+          )
+          print("Training done. Results:", results)
+          PY
+          echo "Runs tree:" && ls -R runs || true
 
       - name: Stage weights
         run: |
           mkdir -p weights
-          BEST=$(ls -1t runs/detect/*/weights/best.pt | head -n1)
+          BEST=$(ls -1t runs/detect/*/weights/best.pt | head -n1 || true)
           if [ -z "$BEST" ]; then
-            echo "No best.pt found under runs/detect/*/weights/"
-            exit 3
+            echo "No best.pt found under runs/detect/*/weights/"; exit 3
           fi
           cp "$BEST" weights/goldfish_best.pt
           ls -lh weights
@@ -143,12 +157,15 @@ jobs:
           branch: weights/update
           commit-message: "Add/update goldfish weights"
           title: "Add/update goldfish weights"
-          body: "Automated training run (CPU)."
+          body: "Automated training run (CPU) on demo_goldfish_dataset."
           add-paths: |
             weights/goldfish_best.pt
 
-      - name: Upload artifact (optional)
+      - name: Upload artifacts (logs & runs)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: goldfish_best.pt
-          path: weights/goldfish_best.pt
+          name: runs-and-weights
+          path: |
+            runs/**
+            weights/goldfish_best.pt

@@ -1,8 +1,8 @@
 # app_classic.py
-# Goldfish Health Monitor — Classic (color + motion + lightweight tracking)
+# Goldfish Health Monitor — Classic (color + motion + lightweight tracking) with Tank Session memory
 # Run: streamlit run app_classic.py
 
-import os, time, math, cv2, numpy as np
+import os, time, math, uuid, hashlib, cv2, numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 import streamlit as st
@@ -10,7 +10,7 @@ import streamlit as st
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 # =========================
-# UI —— Elegant landing
+# UI —— Clean, non-demo look
 # =========================
 st.set_page_config(
     page_title="Goldfish Health Monitor",
@@ -54,7 +54,7 @@ with left:
           <ul style="margin:0 0 0 1.1rem; line-height:1.8;">
             <li>Detects orange fish (tunable HSV gate) and tracks movement</li>
             <li>Per-fish <b>speed</b> and <b>dwell-zone</b> logic to flag likely fatalities</li>
-            <li>Configurable thresholds, evidence snapshots, and live insights</li>
+            <li>Maintains a <b>Tank Session</b> across the entire video with an overall verdict</li>
           </ul>
         </div>
         """,
@@ -66,7 +66,7 @@ with right:
     st.markdown(
         """
         <div class="card">
-          <b>Quick tips</b><br>
+          <b>Tips</b><br>
           • Upload a short 10–20s clip for fast iteration<br>
           • Tune stillness window & speed threshold per tank<br>
           • Snapshots saved under <code>alerts/</code>
@@ -87,7 +87,7 @@ with st.expander("How it works", expanded=False):
         1) Apply an HSV color gate to isolate orange fish bodies (sidebar).  
         2) Track centroid motion over time with a lightweight ID tracker.  
         3) Compute average velocity over a sliding window; if **low** and the fish dwells near the **top** or **bottom** zones, raise a flag.  
-        4) Store cropped snapshots for review and audit.
+        4) Store cropped snapshots for review and maintain a per-video Tank Session summary.
         """
     )
 
@@ -127,68 +127,68 @@ with st.sidebar:
     st.header("Run")
     start = st.button("▶️ Process")
     stop  = st.button("⏹ Stop")
+    reset = st.button("🧹 Reset session memory")
     if "running" not in st.session_state:
         st.session_state.running = False
     if start: st.session_state.running = True
     if stop:  st.session_state.running = False
 
 # Placeholders
-preview       = st.empty()
-insights_box  = st.container()
-status_banner = st.empty()
+preview        = st.empty()
+insights_live  = st.container()
+insights_tank  = st.container()
+status_banner  = st.empty()
 
 # =========================
 # Simple centroid tracker
 # =========================
+from dataclasses import dataclass, field
 @dataclass
 class Track:
     tid: int
     history: deque = field(default_factory=lambda: deque(maxlen=256))  # (t, x, y)
     last_bbox: tuple = (0, 0, 0, 0)  # x1, y1, x2, y2
-    last_seen: float = 0.0
     last_alert_t: float = 0.0
+    age_frames: int = 0
 
 class CentroidTracker:
     def __init__(self, dist_thresh=50, max_age=30):
         self.next_id = 1
         self.tracks: dict[int, Track] = {}
         self.dist_thresh = dist_thresh
-        self.max_age = max_age  # frames
+        self.max_age = max_age  # frames since last update
 
     def _dist(self, a, b):
         return math.hypot(a[0]-b[0], a[1]-b[1])
 
     def update(self, centroids, bboxes, tstamp):
-        """centroids: [(cx,cy), ...]; bboxes: [(x1,y1,x2,y2), ...]"""
-        # Age out old tracks
+        # age & purge
         for tr in list(self.tracks.values()):
-            tr.last_seen += 1
-            if tr.last_seen > self.max_age:
+            tr.age_frames += 1
+            if tr.age_frames > self.max_age:
                 del self.tracks[tr.tid]
-
-        # Match by nearest
-        assigned = set()
+        # match
+        used = set()
         for i, c in enumerate(centroids):
             best_id, best_d = None, 1e9
             for tr in self.tracks.values():
-                d = self._dist(c, tr.history[-1][1:3]) if tr.history else 1e9
-                if d < best_d and d <= self.dist_thresh:
-                    best_id, best_d = tr.tid, d
+                if tr.history:
+                    d = self._dist(c, tr.history[-1][1:3])
+                    if d < best_d and d <= self.dist_thresh:
+                        best_id, best_d = tr.tid, d
             if best_id is not None:
                 tr = self.tracks[best_id]
                 tr.history.append((tstamp, c[0], c[1]))
                 tr.last_bbox = bboxes[i]
-                tr.last_seen = 0
-                assigned.add(i)
+                tr.age_frames = 0
+                used.add(i)
             else:
-                # New track
                 tid = self.next_id; self.next_id += 1
                 tr = Track(tid=tid)
                 tr.history.append((tstamp, c[0], c[1]))
                 tr.last_bbox = bboxes[i]
-                tr.last_seen = 0
+                tr.age_frames = 0
                 self.tracks[tid] = tr
-
         return self.tracks
 
 # =========================
@@ -220,7 +220,7 @@ def hsv_detect(frame, hsv_range):
     centroids, bboxes = [], []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < 80:  # ignore tiny
+        if area < 80:
             continue
         x, y, w, h = cv2.boundingRect(c)
         cx, cy = x + w/2, y + h/2
@@ -229,7 +229,6 @@ def hsv_detect(frame, hsv_range):
     return centroids, bboxes, mask
 
 def avg_speed_px_per_s(track: Track, now_t: float, window_sec: float):
-    # average over last window_sec
     pts = [p for p in track.history if now_t - p[0] <= window_sec]
     if len(pts) < 2:
         return 0.0
@@ -239,26 +238,68 @@ def avg_speed_px_per_s(track: Track, now_t: float, window_sec: float):
         dist += math.hypot(pts[i][1]-pts[i-1][1], pts[i][2]-pts[i-1][2])
     if dt <= 1e-3:
         return 0.0
-    return dist / dt  # px/sec
+    return dist / dt
 
 def ensure_dir(d):
     os.makedirs(d, exist_ok=True)
 
-def summarize_insights(flagged, moving, silent, top_cnt, bottom_cnt):
+def summarize_live(flagged, moving, silent, top_cnt, bottom_cnt):
     if flagged == 0 and moving > 0:
-        return f"All {moving} tracked fish appear active and healthy."
+        return f"All {moving} actively moving fish look healthy right now."
     if flagged > 0:
         parts = []
-        if top_cnt:
-            parts.append(f"{top_cnt} near the surface")
-        if bottom_cnt:
-            parts.append(f"{bottom_cnt} near the bottom")
-        zone_txt = (", ".join(parts)) if parts else "alert zone(s)"
-        return (f"{flagged} fish are likely dead or distressed "
-                f"(low motion in {zone_txt}).")
+        if top_cnt: parts.append(f"{top_cnt} near the surface")
+        if bottom_cnt: parts.append(f"{bottom_cnt} near the bottom")
+        zone_txt = ", ".join(parts) if parts else "alert zones"
+        return f"{flagged} fish look likely dead or distressed (low motion in {zone_txt})."
     if moving == 0 and silent > 0:
-        return "Fish detected but insufficient motion history yet."
-    return "No fish detected."
+        return "Fish detected but still building motion history…"
+    return "No fish detected at the moment."
+
+# ---- Tank session helpers
+
+def compute_video_key(mode, upload, rtsp):
+    if mode == "Upload MP4" and upload is not None:
+        # use name + size for a stable per-file key
+        upload.seek(0, os.SEEK_END)
+        size = upload.tell()
+        upload.seek(0)
+        sig = f"{upload.name}:{size}"
+        return hashlib.sha1(sig.encode()).hexdigest()
+    elif mode == "RTSP URL":
+        return f"rtsp:{hashlib.sha1(rtsp.encode()).hexdigest()}" if rtsp else f"rtsp:{uuid.uuid4()}"
+    else:
+        # webcam session key changes each time you press Start
+        return f"webcam:{uuid.uuid4()}"
+
+def init_tank_session(key):
+    return {
+        "key": key,
+        "started_at": time.time(),
+        "frames": 0,
+        "unique_tracks": set(),       # any track id ever seen
+        "ever_flagged": set(),        # track ids ever flagged
+        "top_flagged": set(),         # flagged at surface at least once
+        "bottom_flagged": set(),      # flagged at bottom at least once
+        "last_update": time.time(),
+        "events": deque(maxlen=50)    # rolling recent events
+    }
+
+def tank_summary_text(tank):
+    total = len(tank["unique_tracks"])
+    flagged = len(tank["ever_flagged"])
+    tops = len(tank["top_flagged"])
+    bots = len(tank["bottom_flagged"])
+    if total == 0:
+        return "No fish observed yet."
+    if flagged == 0:
+        return f"So far observed {total} unique fish — no fatalities suspected."
+    parts = []
+    if tops: parts.append(f"{tops} near the surface")
+    if bots: parts.append(f"{bots} near the bottom")
+    detail = ", ".join(parts) if parts else "alert zones"
+    return (f"So far observed {total} unique fish; {flagged} have been flagged at least once "
+            f"(low motion in {detail}).")
 
 # =========================
 # Main loop
@@ -266,14 +307,23 @@ def summarize_insights(flagged, moving, silent, top_cnt, bottom_cnt):
 alerts_dir = "alerts"; ensure_dir(alerts_dir)
 cap = open_capture(source_mode, rtsp_url, uploaded_file)
 
+if reset:
+    st.session_state.pop("tank", None)
+
 if not cap:
     status_banner.warning("Provide a valid video source (upload a video, use Webcam 0, or set an RTSP URL).")
     st.stop()
 
+# Establish (or reset) tank session per video/source
+vid_key = compute_video_key(source_mode, uploaded_file, rtsp_url)
+if "tank" not in st.session_state or st.session_state["tank"]["key"] != vid_key:
+    st.session_state["tank"] = init_tank_session(vid_key)
+
+tank = st.session_state["tank"]
+
 tracker = CentroidTracker(dist_thresh=60, max_age=15)
 fps_smooth, last_t = 0.0, time.time()
-
-event_log = deque(maxlen=12)  # keep a small rolling log for display
+event_log = deque(maxlen=12)  # short live log (UI)
 
 while st.session_state.running:
     ok, frame = cap.read()
@@ -293,9 +343,12 @@ while st.session_state.running:
 
     # Detect via HSV
     centroids, bboxes, mask = hsv_detect(frame, (H_low, S_low, V_low, H_high, S_high, V_high))
-
     # Track
     tracks = tracker.update(centroids, bboxes, now_t)
+
+    # Tank memory: frame count
+    tank["frames"] += 1
+    tank["last_update"] = now_t
 
     # Draw
     overlay = frame.copy()
@@ -309,28 +362,36 @@ while st.session_state.running:
     for tr in tracks.values():
         if not tr.history:
             continue
+        tank["unique_tracks"].add(tr.tid)
+
         cx, cy = int(tr.history[-1][1]), int(tr.history[-1][2])
         x1,y1,x2,y2 = map(int, tr.last_bbox)
 
-        # avg speed
         v = avg_speed_px_per_s(tr, now_t, window_sec)
         at_top = cy <= top_h
         at_bottom = cy >= (h - bot_h)
         likely = (v < speed_thresh) and (at_top or at_bottom)
 
-        if v >= speed_thresh:
-            moving += 1
-        else:
-            silent += 1
+        # live counts
+        if v >= speed_thresh: moving += 1
+        else: silent += 1
         if at_top: top_cnt += 1
         if at_bottom: bottom_cnt += 1
         if likely: flagged += 1
 
+        # draw
         color = (0,255,0)
         label = f"id={tr.tid} v={v:.0f}px/s"
         if likely:
             color = (0,0,255)
             label += "  ⚠ likely dead"
+            # Tank session memory update
+            if tr.tid not in tank["ever_flagged"]:
+                tank["ever_flagged"].add(tr.tid)
+            if at_top:    tank["top_flagged"].add(tr.tid)
+            if at_bottom: tank["bottom_flagged"].add(tr.tid)
+
+            # evidence snapshot (rate-limited)
             if (now_t - tr.last_alert_t) > 10.0:
                 tr.last_alert_t = now_t
                 crop = overlay[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
@@ -339,7 +400,9 @@ while st.session_state.running:
                 if crop.size > 0:
                     cv2.imwrite(out_path, crop)
                     candidates.append(out_path)
-                    event_log.appendleft(f"{ts}: Track {tr.tid} flagged (v={v:.0f}px/s).")
+                    msg = f"{ts}: Track {tr.tid} flagged (v={v:.0f}px/s)."
+                    event_log.appendleft(msg)
+                    tank["events"].appendleft(msg)
 
         cv2.rectangle(overlay, (x1,y1), (x2,y2), color, 2)
         cv2.putText(overlay, label, (x1, max(0,y1-6)),
@@ -356,7 +419,7 @@ while st.session_state.running:
         mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         overlay = cv2.addWeighted(overlay, 0.8, mask_vis, 0.4, 0)
 
-    # UI updates
+    # UI updates: frame / fps / tracks
     metrics_strip.markdown(
         f'<div class="pill">Frame: {w}×{h}</div>'
         f'<div class="pill">FPS: {fps_smooth:.1f}</div>'
@@ -365,15 +428,14 @@ while st.session_state.running:
     )
     preview.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
 
-    # Insights panel
-    summary = summarize_insights(flagged, moving, silent, top_cnt, bottom_cnt)
-    with insights_box:
-        st.subheader("Insights")
-        st.write(summary)
-
+    # ---------- LIVE INSIGHTS ----------
+    summary_live = summarize_live(flagged, moving, silent, top_cnt, bottom_cnt)
+    with insights_live:
+        st.subheader("Insights (live)")
+        st.write(summary_live)
         cols = st.columns(4)
-        cols[0].metric("Tracked fish", f"{len(tracks)}")
-        cols[1].metric("Likely dead", f"{flagged}")
+        cols[0].metric("Tracked fish (now)", f"{len(tracks)}")
+        cols[1].metric("Likely dead (now)", f"{flagged}")
         cols[2].metric("Avg window (s)", f"{window_sec}")
         cols[3].metric("Speed threshold", f"{speed_thresh} px/s")
 
@@ -384,8 +446,25 @@ while st.session_state.running:
                 ccols[i % len(ccols)].image(p, use_column_width=True)
 
         if event_log:
-            st.markdown("**Event log**")
+            st.markdown("**Event log (live)**")
             for e in list(event_log)[:6]:
+                st.write(f"• {e}")
+
+    # ---------- TANK SESSION SUMMARY ----------
+    with insights_tank:
+        st.subheader("Tank Session (so far)")
+        st.write(tank_summary_text(tank))
+        tcols = st.columns(5)
+        tcols[0].metric("Unique fish observed", f"{len(tank['unique_tracks'])}")
+        tcols[1].metric("Ever flagged", f"{len(tank['ever_flagged'])}")
+        tcols[2].metric("Surface alerts", f"{len(tank['top_flagged'])}")
+        tcols[3].metric("Bottom alerts", f"{len(tank['bottom_flagged'])}")
+        elapsed = max(0, int(time.time() - tank["started_at"]))
+        tcols[4].metric("Session time", f"{elapsed}s")
+
+        if tank["events"]:
+            st.markdown("**Recent session events**")
+            for e in list(tank["events"])[:8]:
                 st.write(f"• {e}")
 
     time.sleep(0.01)
